@@ -9,7 +9,7 @@ What follows is a quick story of how Performance Monitoring was added Sentry.
 The focus is on the SDK API, and what was happening in the industry around the same time, notably OpenTelemetry.
 
 Back in 2019, Sentry started experimenting with [adding tracing to SDKs](https://github.com/getsentry/sentry-python/pull/342).
-That work was contemporary to the [merger of OpenCensus and OpenTracing to form OpenTelemetry](https://medium.com/opentracing/a-roadmap-to-convergence-b074e5815289).
+That work was contemporary to the [merger of OpenCensus and OpenTracing to form OpenTelemetry](https://medium.com/opentracing/a-roadmap-to-convergence-b074e5815289). After settling with an API, performance was then added to the [JavaScript SDK](https://github.com/getsentry/sentry-javascript/pull/2161).
 
 While we had ideas of our own, our API and implementations borrowed inspiration from pre-1.0 versions of OpenTelemetry, when OpenTelemetry was still in its infancy.
 For example, our [list of span statuses](https://github.com/getsentry/relay/blob/55127c75d4eeebf787848a05a12150ee5c59acd9/relay-common/src/constants.rs#L179-L181) openly match those that could be found in the OpenTelemetry spec around the end of 2019.
@@ -47,10 +47,15 @@ In SDKs, transactions are quite different from other spans in that they are embe
 
 Over time, we had to make adjustments in the backend, for example splitting the storage of errors and transactions.
 
-`beforeSend`
-`tracesSampler`
+To not break customer setups, we elected to [not send transaction events](https://github.com/getsentry/sentry-python/pull/731) through the `beforeSend` callback. This was for two reasons. First, to make sure that customers with existing `beforeSend` setups did erroneously filter or mutate transactions, and second to prevent users from relying on the API to mutate transaction attributes as this would [break customers when single span ingestion is eventually introduced](https://github.com/getsentry/sentry-javascript/pull/2600#issuecomment-634697123).
 
-`idleTransaction` + `beforeNavigate`
+To provide an alternative to users, transactions still go through `eventProcessors`, so users could use `Sentry.addGlobalEventProcessors()` to mutate transactions as needed. This has [some caveats](https://github.com/getsentry/sentry-python/pull/731#issuecomment-663046894), mainly around sampling, but was left as event processors are considered a mostly internal API.
+
+Sampling is a critical part of distributed tracing and an important part of Sentry's performance product. When performance was first implemented in the Python and JavaScript SDKs, transactions and spans were sampled based on a given sampling probability. This sampling probability, provided as a `tracesSampleRate` option, was a float that ranged between `0` and `1`. As time went on, user's required more granular sampling controls, especially leveraging scope data to prioritize sampling.
+
+<!-- TODO: Talk more about tracesSampler, and SamplingContext. Add context about head based sampling, dynamic sampling, filtering in the SDK -->
+
+To enable auto-instrumentation for Browser JavaScript, the concept of an `IdleTransaction` was introduced. Unlike a request to a web server or database query, there is no defined end of a pageload. To measure browser pageloads or navigations (in the case of SPAs), we start an [`IdleTransaction`]((https://github.com/getsentry/sentry-javascript/blob/master/packages/tracing/src/idletransaction.ts)) that will automatically finish after it's child spans have finished.
 
 ## Identified Issues
 
@@ -125,3 +130,30 @@ Sometimes `tags` and other shared global state must be changed in the middle of 
 
 
 - How to do versioned docs?
+
+
+## Appendix
+
+### IdleTransactions
+
+A `IdleTransaction` keeps track child spans through the concept of activities. Activities are typed as `Set<span_id>`, where an activity is added when a child span is started, and removed when a child span is finished. When an activity is removed, and the `activities` set becomes empty, the `idleTransaction` finishes itself.
+
+The `IdleTransaction` exposes functionality to register [`beforeFinish` callbacks](https://github.com/getsentry/sentry-javascript/blob/master/packages/tracing/src/idletransaction.ts#L159), which runs right before the transaction is sent to Sentry. This has to be done because the `IdleTransaction` finishes at an unknown time, so these callbacks have to be set up ahead of time. The browser tracing integration uses this to add measurements (web vitals) and additional spans based on heuristics (like browser specific resource spans).
+
+In addition, the `IdleTransaction` also trims its end timestamp to match the time of it's last child span end timestamp (as its end timestamp is kind of arbitrary, doesn't have that much value).
+
+Let's talk about some possible gotchas:
+
+1. No child spans are created:
+
+Right now if no child spans are created for an `IdleTransaction`, it will end itself after a configured `IdleTimeout`. This is 1000ms by default, but user-configurable for automatically created pageload/navigation transactions.
+
+ 2. Spans never finish
+
+The `IdleTransaction` sets up a heartbeat counter that will ping itself according to a heartbeat timer. If the heartbeat is pinged 3 times, the `IdleTransaction` will finish all of it's active child spans, mark those span's `SpanStatus` as `Cancelled`, and then finish itself. The heartbeat counter is reset everytime a new child span is started (new activity is created)
+
+3. The polling problem aka: 1 -> 0 -> 1 -> 0
+
+To prevent "polling" child spans from increasing transaction duration, after the `IdleTransaction` hits 0 activities for the first time, we call `transaction.finish()` after a set timeout. This is to prevent a transaction from going on infinitely if a user keeps adding child spans. As a consequence of this though, there might still be unfinished spans on a transaction, even if the transaction is finished. 
+
+Here's an example situation: idle transaction is created -> idle transaction starts child spans (activities) -> idle transaction activities hit 0 (all active spans have finished) -> transaction sets timeout to call `.finish()` -> child spans get added to transaction -> transaction calls `.finish()` -> latter child spans do not get recorded because they have not called `.finish()`.
