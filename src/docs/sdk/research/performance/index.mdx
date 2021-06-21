@@ -4,6 +4,8 @@
 
 What follows is a quick story of how Performance Monitoring was added Sentry.
 
+<!-- We may want to include here some introduction of why we added Performance Monitoring to Sentry -->
+
 The focus is on the SDK API, and what was happening in the industry around the same time, notably OpenTelemetry.
 
 Back in 2019, Sentry started experimenting with [adding tracing to SDKs](https://github.com/getsentry/sentry-python/pull/342).
@@ -28,24 +30,41 @@ Our initial implementation reused the mechanisms we had in place for error repor
 - And since we were sharing the ingestion pipeline, that meant we were sharing storage and the many parts of the processing that happens to all events.
 
 Our implementation evolved such that there was a clear emphasis on the distiction between Transactions and Spans.
-Part of that was a side
+Part of that was a side effect from reusing `Event`.
 
-Transactions resonated well with customers. The concept helped people understand ...
+Transactions resonated well with customers. Transactions highlight major chunks of work their code is doing. Customers can see and navigate through a list of transactions, while within a transaction the spans give detailed timing for more granular units of work.
 
 But that model has both extra complexities for instrumentation and limited our ingestion model requiring grouping all spans in memory before sending.
 
 In SDKs, transactions are quite different from other spans in that they are embedded in a Sentry event container and follow a different protocol format than spans. Spans themselves can only be contained by a transaction.
 
 
-## Notable Changes
+<!--
+- Billing is per Transaction (just like it used to be per error-event). This means that removing or changing things related to transactions directly affect billing.
+-->
 
-Although not strictly related to transactions, the [Envelope](https://develop.sentry.dev/sdk/envelopes/) format was introduced, adding more metadata to request payloads and allowing sending different data types to the same endpoint.
+## Notable Changes
 
 Over time, we had to make adjustments in the backend, for example splitting the storage of errors and transactions.
 
+`beforeSend`
+`tracesSampler`
 
+`idleTransaction` + `beforeNavigate`
 
+## Identified Issues
 
+- The user experience is centered entirely around the part of a trace that exists below transactions. This means that data cannot exist outside of a transaction even if exists in a trace. This, in turn, means that currently in a lot of situations a trace is missing crucial information that can help debug issues, particularly on the frontend where transactions need to end at one point but execution might continue.
+- SDKs are discouraged to send nested transactions as those inherently imply duplication of spans.
+- The SDK API does not currently permit span collection unless a transaction has been explicitly created first. Continuing a trace requires starting a transaction. This is inconsistent with OpenTelemetry and also means that transactions need to be created which often is not possible yet. This also in turn now means that transaction spans are mutable as the necessary information is often not available until later.
+- The SDK API exposes the transaction object to users cementing in the problem with memory consumption. To modify all data attached one often needs to modify this transaction object. It's not possible for SDKs to only provide access to spans for processing because transactions, when transformed into events for sending to Sentry, assume a shape incompatible with spans including a lot of information (for example, contexts) that is not available to spans.
+
+Other issues:
+
+<!-- these below we want to address some day, and thus whatever changes we make should keep those in mind, but we're not solving these in 2021 Q2 -->
+
+- Tracing implementation with transactions require buffering of all spans in memory. This means recording 100% of spans for server-side applications, even in a simplified form, that supports metric extraction is not feasible due to the overhead caused.
+- The special treatment of transactions is incompatible with OpenTelemetry which means we cannot implement an OpenTelemetry Exporter that can feed data into Sentry (though we have a [Sentry Exporter with a major correctness limitation](https://github.com/open-telemetry/opentelemetry-collector-contrib/tree/main/exporter/sentryexporter#known-limitations)). Likewise we cannot leverage OpenTelemetry SDKs and instrumentations.
 
 ## Next Steps
 
@@ -68,3 +87,41 @@ Next Steps
 
 - Work on ingestion; can we ingest spans that are not transactions?
 - Work on product to shift focus from transactions into traces and spans outside transactions
+
+
+## Introduction
+
+##
+
+Use Cases / Acceptance Test Scenarios
+
+
+- Nested sentry.trace()
+- How does `sentry.trace` know what the parent SpanID is?
+- How does it work with `async`, Promises, setTimeout, event handlers, etc
+- Do we store the current span in the scope/context?
+
+
+- Keep Mobile in mind
+
+- How do breadcrumbs work?
+- How can we have two modes of breadcrumb recording? One that forks with Hub cloning and provides data isolation with separate scopes, and one that shares data with sibling spans/threads.
+
+  |
+  |- span1
+  |- span2
+    |- span2.a
+    |- span2.b  ERROR
+
+ In mode 1, error in `span2.b` only sees breadcrumbs from the `span2` subtree (think data isolation for multiple requests in a web server).
+ In mode 2, error in `span2.b` will have breadcrumbs from span1 and its children in addition to span2 (think mobile app with multiple threads).
+
+
+More than just breadcrumbs, in mobile we want to have shared state for multiple parts of the SDK, such as current user, tags, contexts, extras, etc.
+
+Sometimes `tags` and other shared global state must be changed in the middle of a program execution, not necessarily in the beginning.
+
+
+
+
+- How to do versioned docs?
